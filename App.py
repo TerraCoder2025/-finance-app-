@@ -1,0 +1,1292 @@
+# app1.py - 带用户登录的智能记账本（完整版）
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import plotly.express as px
+import plotly.graph_objects as go
+import json
+import os
+import hashlib
+
+
+class UserManager:
+    def __init__(self):
+        self.users_file = "users.json"
+        self.setup_users_file()
+
+    def setup_users_file(self):
+        """初始化用户文件"""
+        if not os.path.exists(self.users_file):
+            with open(self.users_file, 'w', encoding='utf-8') as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+
+    def hash_password(self, password):
+        """密码加密"""
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def register_user(self, username, password):
+        """注册新用户"""
+        try:
+            with open(self.users_file, 'r', encoding='utf-8') as f:
+                users = json.load(f)
+
+            if username in users:
+                return False, "用户名已存在"
+
+            # 创建用户数据目录
+            user_data_dir = f"user_data/{username}"
+            os.makedirs(user_data_dir, exist_ok=True)
+
+            # 保存用户信息
+            users[username] = {
+                "password_hash": self.hash_password(password),
+                "created_at": datetime.now().isoformat(),
+                "data_dir": user_data_dir
+            }
+
+            with open(self.users_file, 'w', encoding='utf-8') as f:
+                json.dump(users, f, ensure_ascii=False, indent=2)
+
+            # 初始化用户数据文件
+            self.init_user_data(username)
+            return True, "注册成功"
+
+        except Exception as e:
+            return False, f"注册失败: {str(e)}"
+
+    def verify_user(self, username, password):
+        """验证用户登录"""
+        try:
+            with open(self.users_file, 'r', encoding='utf-8') as f:
+                users = json.load(f)
+
+            if username in users and users[username]["password_hash"] == self.hash_password(password):
+                return True, "登录成功"
+            else:
+                return False, "用户名或密码错误"
+
+        except Exception as e:
+            return False, f"登录失败: {str(e)}"
+
+    def init_user_data(self, username):
+        """初始化用户数据 - 按月预算版本"""
+        user_data_file = f"user_data/{username}/finance_data.json"
+        if not os.path.exists(user_data_file):
+            initial_data = {
+                'transactions': [],
+                'bank_accounts': {},
+                'debts': {},
+                'budgets': {}  # 按月存储预算
+            }
+            with open(user_data_file, 'w', encoding='utf-8') as f:
+                json.dump(initial_data, f, ensure_ascii=False, indent=2)
+
+
+class FinanceApp:
+    def __init__(self, username):
+        self.username = username
+        self.data_file = f"user_data/{username}/finance_data.json"
+        self.setup_session_state()
+        self.load_data()
+
+    def setup_session_state(self):
+        """初始化会话状态"""
+        if 'transactions' not in st.session_state:
+            st.session_state.transactions = pd.DataFrame(columns=[
+                '日期', '类型', '类别', '项目描述', '金额', '币种', '支付方式', '对方账户', '汇率', '备注'
+            ])
+
+        if 'bank_accounts' not in st.session_state:
+            st.session_state.bank_accounts = {}
+
+        if 'debts' not in st.session_state:
+            st.session_state.debts = {}
+
+        if 'budgets' not in st.session_state:
+            st.session_state.budgets = {}  # 改为空字典
+
+        # 初始化编辑状态
+        if 'editing_index' not in st.session_state:
+            st.session_state.editing_index = None
+
+    def load_data(self):
+        """从文件加载数据"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                if 'transactions' in data and data['transactions']:
+                    st.session_state.transactions = pd.DataFrame(data['transactions'])
+                if 'bank_accounts' in data:
+                    st.session_state.bank_accounts = data['bank_accounts']
+                if 'debts' in data:
+                    st.session_state.debts = data['debts']
+                if 'budgets' in data:
+                    st.session_state.budgets = data['budgets']
+
+        except Exception as e:
+            st.error(f"加载数据失败: {e}")
+
+    def save_data(self):
+        """保存数据到文件"""
+        try:
+            data = {
+                'transactions': st.session_state.transactions.to_dict('records'),
+                'bank_accounts': st.session_state.bank_accounts,
+                'debts': st.session_state.debts,
+                'budgets': st.session_state.budgets
+            }
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.error(f"保存数据失败: {e}")
+
+    def get_currency_statistics(self, df):
+        """获取币种统计信息"""
+        currency_stats = {}
+
+        income_by_currency = df[df['类型'] == '收入'].groupby('币种')['金额'].sum()
+        for currency, amount in income_by_currency.items():
+            if currency not in currency_stats:
+                currency_stats[currency] = {'收入': 0, '支出': 0}
+            currency_stats[currency]['收入'] = amount
+
+        expense_by_currency = df[df['类型'] == '支出'].groupby('币种')['金额'].sum()
+        for currency, amount in expense_by_currency.items():
+            if currency not in currency_stats:
+                currency_stats[currency] = {'收入': 0, '支出': 0}
+            currency_stats[currency]['支出'] = amount
+
+        for currency in currency_stats:
+            currency_stats[currency]['结余'] = (
+                    currency_stats[currency]['收入'] - currency_stats[currency]['支出']
+            )
+
+        return currency_stats
+
+    def sidebar(self):
+        """侧边栏"""
+        st.sidebar.title(f"💼 {self.username}的记账本")
+        st.sidebar.markdown("---")
+
+        # 快速统计
+        total_assets = sum(account["余额"] for account in st.session_state.bank_accounts.values())
+        total_debts = sum(debt["剩余"] for debt in st.session_state.debts.values())
+        net_worth = total_assets - total_debts
+
+        st.sidebar.metric("💰 总资产", f"¥{total_assets:,.2f}")
+        st.sidebar.metric("📋 总债务", f"¥{total_debts:,.2f}")
+        st.sidebar.metric("🏆 净资产", f"¥{net_worth:,.2f}")
+
+        st.sidebar.markdown("---")
+
+        # 银行卡快速查看
+        st.sidebar.subheader("🏦 银行卡余额")
+        for account, info in st.session_state.bank_accounts.items():
+            currency_symbol = "¥" if info["币种"] == "人民币" else "RM"
+            st.sidebar.write(f"**{account}**: {currency_symbol}{info['余额']:,.2f}")
+
+        st.sidebar.markdown("---")
+
+        # 退出登录按钮
+        if st.sidebar.button("🚪 退出登录", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.current_user = None
+            st.rerun()
+
+        st.sidebar.info("💡 提示：数据自动保存，仅您本人可见")
+
+    def add_transaction_form(self):
+        """添加交易表单"""
+        st.header("➕ 添加新交易")
+
+        with st.form("transaction_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                date = st.date_input("📅 日期", datetime.now())
+                transaction_type = st.selectbox("🔸 类型", ["收入", "支出", "转账"])
+                category = st.selectbox("📂 类别", self.get_categories(transaction_type))
+                description = st.text_input("📝 项目描述", placeholder="例如：11月工资、超市购物等")
+                amount = st.number_input("💰 金额", min_value=0.0, step=0.01, format="%.2f")
+
+            with col2:
+                currency = st.selectbox("🌐 币种", ["人民币", "马币"])
+
+                payment_options = list(st.session_state.bank_accounts.keys()) + ["现金", "微信支付", "支付宝"]
+                payment_method = st.selectbox("💳 支付方式", payment_options)
+
+                if transaction_type == "转账":
+                    target_options = list(st.session_state.bank_accounts.keys()) + ["现金", "微信支付", "支付宝",
+                                                                                    "其他银行卡"]
+                    target_account = st.selectbox("➡️ 对方账户", target_options)
+                    exchange_rate = st.number_input("🔁 汇率", min_value=0.0, step=0.01, value=1.0, format="%.2f")
+
+                    is_self_transfer = (payment_method in st.session_state.bank_accounts and
+                                        target_account in st.session_state.bank_accounts)
+
+                    if is_self_transfer:
+                        st.info("💡 本人账户间转账，不计入收支")
+                    else:
+                        st.info("💡 向他人转账，将计入支出")
+                else:
+                    target_account = ""
+                    exchange_rate = 1.0
+
+                notes = st.text_input("📋 备注", placeholder="可选备注信息")
+
+            submitted = st.form_submit_button("✅ 添加交易", use_container_width=True)
+
+            if submitted:
+                if amount <= 0:
+                    st.error("❌ 金额必须大于0")
+                elif transaction_type == "转账" and payment_method == target_account:
+                    st.error("❌ 转账时支付方式和对方账户不能相同")
+                else:
+                    self.add_transaction({
+                        '日期': date.strftime("%Y-%m-%d"),
+                        '类型': transaction_type,
+                        '类别': category,
+                        '项目描述': description,
+                        '金额': amount,
+                        '币种': currency,
+                        '支付方式': payment_method,
+                        '对方账户': target_account,
+                        '汇率': exchange_rate,
+                        '备注': notes
+                    })
+                    st.success("✅ 交易添加成功！")
+                    self.save_data()
+
+    def get_categories(self, transaction_type):
+        """根据交易类型返回类别"""
+        income_categories = ["工资", "兼职", "投资收入", "奖金", "退款", "其他收入"]
+        expense_categories = ["房租", "水电费", "生活费", "奶粉", "学费", "购物", "餐饮", "交通", "娱乐", "医疗",
+                              "还款", "其他支出"]
+
+        if transaction_type == "收入":
+            return income_categories
+        elif transaction_type == "支出":
+            return expense_categories
+        else:
+            return [""]
+
+    def add_transaction(self, transaction_data):
+        """添加交易到数据"""
+        new_transaction = pd.DataFrame([transaction_data])
+        st.session_state.transactions = pd.concat([st.session_state.transactions, new_transaction], ignore_index=True)
+
+        self.update_bank_balance(transaction_data)
+
+        if transaction_data['类型'] == '支出' and transaction_data['类别'] == '还款':
+            self.update_debt(transaction_data['金额'])
+
+    def update_bank_balance(self, transaction):
+        """更新银行卡余额"""
+        payment_method = transaction['支付方式']
+        amount = transaction['金额']
+        transaction_type = transaction['类型']
+
+        if payment_method in st.session_state.bank_accounts:
+            if transaction_type == "收入":
+                st.session_state.bank_accounts[payment_method]["余额"] += amount
+            elif transaction_type == "支出":
+                st.session_state.bank_accounts[payment_method]["余额"] -= amount
+            elif transaction_type == "转账":
+                target_account = transaction['对方账户']
+                exchange_rate = transaction['汇率']
+
+                is_self_transfer = (payment_method in st.session_state.bank_accounts and
+                                    target_account in st.session_state.bank_accounts)
+
+                if is_self_transfer:
+                    st.session_state.bank_accounts[payment_method]["余额"] -= amount
+                    st.session_state.bank_accounts[target_account]["余额"] += amount * exchange_rate
+                else:
+                    st.session_state.bank_accounts[payment_method]["余额"] -= amount
+
+    def update_debt(self, amount):
+        """更新债务"""
+        for debt_name in st.session_state.debts:
+            if st.session_state.debts[debt_name]["状态"] == "还款中":
+                remaining = st.session_state.debts[debt_name]["剩余"]
+                if remaining > 0:
+                    new_remaining = max(0, remaining - amount)
+                    st.session_state.debts[debt_name]["剩余"] = new_remaining
+                    if new_remaining == 0:
+                        st.session_state.debts[debt_name]["状态"] = "已还清"
+                    break
+
+    def show_transactions(self):
+        """显示交易记录"""
+        st.header("📊 交易记录")
+
+        if not st.session_state.transactions.empty:
+            # 筛选功能
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                filter_type = st.selectbox("筛选类型", ["全部", "收入", "支出", "转账"])
+            with col2:
+                filter_category = st.selectbox("筛选类别",
+                                               ["全部"] + list(st.session_state.transactions['类别'].unique()))
+            with col3:
+                bank_options = list(st.session_state.bank_accounts.keys()) + ["现金", "微信支付", "支付宝"]
+                filter_bank = st.selectbox("筛选支付方式", ["全部"] + bank_options)
+            with col4:
+                date_range = st.selectbox("时间范围", ["全部", "最近7天", "最近30天", "本月"])
+
+            filtered_df = st.session_state.transactions.copy()
+
+            if filter_type != "全部":
+                filtered_df = filtered_df[filtered_df['类型'] == filter_type]
+            if filter_category != "全部":
+                filtered_df = filtered_df[filtered_df['类别'] == filter_category]
+            if filter_bank != "全部":
+                filtered_df = filtered_df[filtered_df['支付方式'] == filter_bank]
+
+            if date_range != "全部":
+                today = datetime.now().date()
+                if date_range == "最近7天":
+                    start_date = today - timedelta(days=7)
+                elif date_range == "最近30天":
+                    start_date = today - timedelta(days=30)
+                elif date_range == "本月":
+                    start_date = today.replace(day=1)
+
+                filtered_df['日期'] = pd.to_datetime(filtered_df['日期'])
+                filtered_df = filtered_df[filtered_df['日期'] >= pd.Timestamp(start_date)]
+                filtered_df['日期'] = filtered_df['日期'].dt.strftime('%Y-%m-%d')
+
+            st.dataframe(
+                filtered_df.style.format({
+                    '金额': '{:,.2f}',
+                    '汇率': '{:.2f}'
+                }),
+                use_container_width=True,
+                height=400
+            )
+
+            # 币种统计
+            st.subheader("💰 币种统计")
+            currency_stats = self.get_currency_statistics(filtered_df)
+
+            if currency_stats:
+                cols = st.columns(len(currency_stats))
+                for i, (currency, stats) in enumerate(currency_stats.items()):
+                    with cols[i]:
+                        currency_symbol = "¥" if currency == "人民币" else "RM"
+                        st.metric(f"{currency}收入", f"{currency_symbol}{stats['收入']:,.2f}")
+                        st.metric(f"{currency}支出", f"{currency_symbol}{stats['支出']:,.2f}")
+                        st.metric(f"{currency}结余", f"{currency_symbol}{stats['结余']:,.2f}")
+
+        else:
+            st.info("📝 暂无交易记录，请添加第一笔交易")
+
+    def show_bank_accounts(self):
+        """显示银行卡信息"""
+        st.header("🏦 银行卡管理")
+
+        # 添加银行卡
+        st.subheader("➕ 添加银行卡")
+        with st.form("add_bank_form"):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                bank_name = st.text_input("银行卡名称", placeholder="例如：中国银行储蓄卡")
+            with col2:
+                initial_balance = st.number_input("初始余额", min_value=0.0, step=100.0, value=0.0, format="%.2f")
+            with col3:
+                bank_currency = st.selectbox("币种", ["人民币", "马币"])
+
+            submitted = st.form_submit_button("✅ 添加银行卡", use_container_width=True)
+
+            if submitted:
+                if bank_name and bank_name.strip():
+                    if bank_name not in st.session_state.bank_accounts:
+                        st.session_state.bank_accounts[bank_name] = {
+                            "余额": initial_balance,
+                            "币种": bank_currency
+                        }
+                        st.success(f"✅ 成功添加银行卡: {bank_name}")
+                        self.save_data()
+                        st.rerun()
+                    else:
+                        st.error("❌ 银行卡名称已存在")
+                else:
+                    st.error("❌ 请输入银行卡名称")
+
+        st.markdown("---")
+
+        # 显示银行卡列表
+        if st.session_state.bank_accounts:
+            st.subheader("💳 银行卡列表")
+            bank_data = []
+            for account, info in st.session_state.bank_accounts.items():
+                currency_symbol = "¥" if info["币种"] == "人民币" else "RM"
+                bank_data.append({
+                    "银行卡": account,
+                    "币种": info["币种"],
+                    "当前余额": f"{currency_symbol}{info['余额']:,.2f}"
+                })
+
+            bank_df = pd.DataFrame(bank_data)
+            st.dataframe(bank_df, use_container_width=True)
+
+            # 余额图表
+            st.subheader("📊 银行卡余额分布")
+            chart_data = []
+            for account, info in st.session_state.bank_accounts.items():
+                chart_data.append({
+                    "银行卡": account,
+                    "余额": info["余额"],
+                    "币种": info["币种"]
+                })
+
+            chart_df = pd.DataFrame(chart_data)
+            fig = px.bar(chart_df, x='银行卡', y='余额', title='银行卡余额分布', color='银行卡')
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("🏦 暂无银行卡数据，请先添加银行卡")
+
+    def show_debts(self):
+        """显示债务管理 - 完整版（带银行卡还款）"""
+        st.header("📋 债务管理")
+
+        # 添加债务
+        st.subheader("➕ 添加新债务")
+        with st.form("add_debt_form"):
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                debt_name = st.text_input("债务名称", placeholder="例如：信用卡、个人借款等")
+            with col2:
+                debt_total = st.number_input("借款总额", min_value=0.0, step=100.0, value=1000.0, format="%.2f")
+            with col3:
+                debt_remaining = st.number_input("剩余金额", min_value=0.0, step=100.0, value=1000.0, format="%.2f")
+            with col4:
+                debt_currency = st.selectbox("币种", ["人民币", "马币"])
+
+            submitted = st.form_submit_button("✅ 添加债务", use_container_width=True)
+
+            if submitted:
+                if debt_name and debt_name.strip():
+                    if debt_name not in st.session_state.debts:
+                        status = "已还清" if debt_remaining == 0 else "还款中"
+                        st.session_state.debts[debt_name] = {
+                            "总额": debt_total,
+                            "剩余": debt_remaining,
+                            "状态": status,
+                            "币种": debt_currency,
+                            "创建时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        st.success(f"✅ 成功添加债务: {debt_name}")
+                        self.save_data()
+                        st.rerun()
+                    else:
+                        st.error("❌ 债务名称已存在")
+                else:
+                    st.error("❌ 请输入债务名称")
+
+        st.markdown("---")
+
+        # 显示债务列表和编辑功能
+        if st.session_state.debts:
+            st.subheader("📊 债务概览")
+
+            # 债务统计数据
+            total_debt = sum(debt["总额"] for debt in st.session_state.debts.values())
+            remaining_debt = sum(debt["剩余"] for debt in st.session_state.debts.values())
+            paid_debt = total_debt - remaining_debt
+            overall_progress = (paid_debt / total_debt * 100) if total_debt > 0 else 0
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("总债务金额", f"¥{total_debt:,.2f}")
+            with col2:
+                st.metric("剩余债务", f"¥{remaining_debt:,.2f}")
+            with col3:
+                st.metric("已还金额", f"¥{paid_debt:,.2f}")
+            with col4:
+                st.metric("总还款进度", f"{overall_progress:.1f}%")
+
+            st.markdown("---")
+
+            # 债务详细列表
+            st.subheader("📝 债务详情")
+
+            # 创建债务数据表格
+            debt_data = []
+            for debt_name, debt_info in st.session_state.debts.items():
+                total = debt_info["总额"]
+                remaining = debt_info["剩余"]
+                paid = total - remaining
+                progress = (paid / total * 100) if total > 0 else 0
+                currency_symbol = "¥" if debt_info.get("币种", "人民币") == "人民币" else "RM"
+
+                debt_data.append({
+                    "债务名称": debt_name,
+                    "币种": debt_info.get("币种", "人民币"),
+                    "借款总额": total,
+                    "剩余金额": remaining,
+                    "已还金额": paid,
+                    "还款进度": progress,
+                    "状态": debt_info["状态"],
+                    "创建时间": debt_info.get("创建时间", "未知")
+                })
+
+            debt_df = pd.DataFrame(debt_data)
+
+            if not debt_df.empty:
+                # 格式化显示用的DataFrame
+                display_df = debt_df.copy()
+                display_df["借款总额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['借款总额']:,.2f}", axis=1
+                )
+                display_df["剩余金额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['剩余金额']:,.2f}", axis=1
+                )
+                display_df["已还金额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['已还金额']:,.2f}", axis=1
+                )
+                display_df["还款进度"] = display_df["还款进度"].apply(lambda x: f"{x:.1f}%")
+
+                st.dataframe(
+                    display_df[
+                        ["债务名称", "币种", "借款总额", "剩余金额", "已还金额", "还款进度", "状态", "创建时间"]],
+                    use_container_width=True,
+                    height=400
+                )
+
+                # 债务编辑功能
+                st.subheader("✏️ 编辑债务")
+                col1, col2, col3 = st.columns([2, 1, 1])
+
+                with col1:
+                    edit_debts = list(st.session_state.debts.keys())
+                    selected_debt = st.selectbox("选择要编辑的债务", edit_debts, key="debt_selector")
+
+                if selected_debt:
+                    debt_info = st.session_state.debts[selected_debt]
+
+                    col2, col3, col4 = st.columns(3)
+
+                    with col2:
+                        new_debt_total = st.number_input(
+                            "借款总额",
+                            min_value=0.0,
+                            step=100.0,
+                            value=float(debt_info["总额"]),
+                            format="%.2f",
+                            key="edit_debt_total"
+                        )
+
+                    with col3:
+                        new_debt_remaining = st.number_input(
+                            "剩余金额",
+                            min_value=0.0,
+                            step=100.0,
+                            value=float(debt_info["剩余"]),
+                            format="%.2f",
+                            key="edit_debt_remaining"
+                        )
+
+                    with col4:
+                        new_debt_currency = st.selectbox(
+                            "币种",
+                            ["人民币", "马币"],
+                            index=0 if debt_info.get("币种", "人民币") == "人民币" else 1,
+                            key="edit_debt_currency"
+                        )
+
+                    # 按钮列
+                    col5, col6, col7 = st.columns(3)
+
+                    with col5:
+                        if st.button("✅ 更新债务", use_container_width=True, key="update_debt"):
+                            # 验证数据
+                            if new_debt_remaining > new_debt_total:
+                                st.error("❌ 剩余金额不能大于借款总额")
+                            else:
+                                st.session_state.debts[selected_debt]["总额"] = new_debt_total
+                                st.session_state.debts[selected_debt]["剩余"] = new_debt_remaining
+                                st.session_state.debts[selected_debt]["币种"] = new_debt_currency
+
+                                # 更新状态
+                                status = "已还清" if new_debt_remaining == 0 else "还款中"
+                                st.session_state.debts[selected_debt]["状态"] = status
+
+                                st.success(f"✅ 成功更新债务: {selected_debt}")
+                                self.save_data()
+                                st.rerun()
+
+                    with col6:
+                        # 快速还款功能 - 增强版（带银行卡选择）
+                        if debt_info["状态"] == "还款中":
+                            st.subheader("💳 快速还款")
+
+                            # 获取可用的银行卡
+                            available_banks = self.get_available_banks_for_repayment(debt_info.get("币种", "人民币"))
+
+                            if not available_banks:
+                                st.warning("⚠️ 没有可用的银行卡进行还款，请先添加银行卡")
+                            else:
+                                # 还款金额输入
+                                quick_payment = st.number_input(
+                                    "还款金额",
+                                    min_value=0.0,
+                                    max_value=float(debt_info["剩余"]),
+                                    step=100.0,
+                                    value=min(500.0, float(debt_info["剩余"])),
+                                    format="%.2f",
+                                    key="quick_payment"
+                                )
+
+                                # 银行卡选择
+                                selected_bank = st.selectbox(
+                                    "选择还款银行卡",
+                                    available_banks,
+                                    key="repayment_bank"
+                                )
+
+                                # 显示银行卡余额信息
+                                if selected_bank in st.session_state.bank_accounts:
+                                    bank_balance = st.session_state.bank_accounts[selected_bank]["余额"]
+                                    bank_currency = st.session_state.bank_accounts[selected_bank]["币种"]
+                                    currency_symbol = "¥" if bank_currency == "人民币" else "RM"
+                                    st.info(f"**{selected_bank}** 当前余额: {currency_symbol}{bank_balance:,.2f}")
+
+                                    # 检查余额是否足够
+                                    if quick_payment > bank_balance:
+                                        st.error("❌ 银行卡余额不足，无法完成还款")
+                                    else:
+                                        if st.button("💳 确认还款", use_container_width=True, key="quick_repay"):
+                                            # 执行还款操作
+                                            success = self.process_repayment(
+                                                selected_debt,
+                                                quick_payment,
+                                                selected_bank
+                                            )
+                                            if success:
+                                                st.success(f"✅ 成功从 {selected_bank} 还款 {quick_payment:,.2f} 元")
+                                                self.save_data()
+                                                st.rerun()
+
+                    with col7:
+                        # 删除功能
+                        st.subheader("🗑️ 删除债务")
+                        delete_confirmed = st.checkbox(
+                            f"确认删除 '{selected_debt}' 债务",
+                            key=f"confirm_delete_debt_{selected_debt}"
+                        )
+
+                        if st.button(
+                                "删除债务",
+                                use_container_width=True,
+                                type="secondary",
+                                disabled=not delete_confirmed,
+                                key=f"delete_debt_{selected_debt}"
+                        ):
+                            if st.session_state.debts[selected_debt]["剩余"] > 0:
+                                st.warning(
+                                    f"⚠️ 该债务还有 {st.session_state.debts[selected_debt]['剩余']:,.2f} 元未还清")
+
+                            # 执行删除
+                            del st.session_state.debts[selected_debt]
+                            st.success(f"✅ 成功删除债务: {selected_debt}")
+                            self.save_data()
+                            st.rerun()
+
+                    # 债务可视化
+                    st.markdown("---")
+                    st.subheader("📊 债务分析")
+
+                    # 还款进度条
+                    for _, debt_row in debt_df.iterrows():
+                        debt_name = debt_row["债务名称"]
+                        progress = debt_row["还款进度"]
+                        total = debt_row["借款总额"]
+                        remaining = debt_row["剩余金额"]
+                        currency_symbol = "¥" if debt_row["币种"] == "人民币" else "RM"
+
+                        col1, col2 = st.columns([3, 1])
+
+                        with col1:
+                            # 设置进度条颜色
+                            if progress == 100:
+                                color = "green"
+                            elif progress >= 50:
+                                color = "blue"
+                            else:
+                                color = "orange"
+
+                            st.progress(
+                                progress / 100,
+                                text=f"{debt_name}: {currency_symbol}{total - remaining:,.2f} / {currency_symbol}{total:,.2f} ({progress:.1f}%)"
+                            )
+
+                        with col2:
+                            status_text = debt_row["状态"]
+                            if "已还清" in status_text:
+                                st.markdown(f"<span style='color: green'>🎉 已还清</span>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"<span style='color: orange'>⏳ 还款中</span>", unsafe_allow_html=True)
+
+                    # 债务分布饼图
+                    if len(debt_df) > 1:
+                        st.subheader("🥧 债务分布")
+                        chart_data = []
+                        for debt_name, info in st.session_state.debts.items():
+                            if info["状态"] == "还款中":  # 只显示未还清的债务
+                                chart_data.append({
+                                    "债务名称": debt_name,
+                                    "剩余金额": info["剩余"],
+                                    "币种": info.get("币种", "人民币")
+                                })
+
+                        if chart_data:
+                            chart_df = pd.DataFrame(chart_data)
+                            fig = px.pie(
+                                chart_df,
+                                values='剩余金额',
+                                names='债务名称',
+                                title='剩余债务分布',
+                                hover_data=['币种']
+                            )
+                            fig.update_traces(textposition='inside', textinfo='percent+label')
+                            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info("📝 暂无债务数据，请先添加债务")
+
+    def get_available_banks_for_repayment(self, debt_currency):
+        """获取可用于还款的银行卡列表"""
+        available_banks = []
+        for bank_name, bank_info in st.session_state.bank_accounts.items():
+            # 检查币种是否匹配且余额大于0
+            if bank_info["币种"] == debt_currency and bank_info["余额"] > 0:
+                available_banks.append(bank_name)
+        return available_banks
+
+    def process_repayment(self, debt_name, payment_amount, bank_name):
+        """处理还款操作"""
+        try:
+            # 更新债务信息
+            current_remaining = st.session_state.debts[debt_name]["剩余"]
+            new_remaining = current_remaining - payment_amount
+
+            if new_remaining < 0:
+                st.error("❌ 还款金额不能超过剩余债务金额")
+                return False
+
+            st.session_state.debts[debt_name]["剩余"] = new_remaining
+
+            # 更新债务状态
+            if new_remaining == 0:
+                st.session_state.debts[debt_name]["状态"] = "已还清"
+
+            # 更新银行卡余额
+            if bank_name in st.session_state.bank_accounts:
+                st.session_state.bank_accounts[bank_name]["余额"] -= payment_amount
+
+            # 记录还款交易
+            repayment_transaction = {
+                '日期': datetime.now().strftime("%Y-%m-%d"),
+                '类型': '支出',
+                '类别': '还款',
+                '项目描述': f"还款 {debt_name}",
+                '金额': payment_amount,
+                '币种': st.session_state.debts[debt_name].get("币种", "人民币"),
+                '支付方式': bank_name,
+                '对方账户': debt_name,
+                '汇率': 1.0,
+                '备注': f"债务还款 - {debt_name}"
+            }
+
+            new_transaction = pd.DataFrame([repayment_transaction])
+            st.session_state.transactions = pd.concat([st.session_state.transactions, new_transaction],
+                                                      ignore_index=True)
+
+            return True
+
+        except Exception as e:
+            st.error(f"❌ 还款处理失败: {str(e)}")
+            return False
+
+    def show_budgets(self):
+        """显示预算管理 - 按月设置版本"""
+        st.header("💰 月度预算管理")
+
+        # 月份选择器
+        st.subheader("📅 选择月份")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            # 年份选择：从2025年到2099年
+            years = list(range(2025, 2100))
+            selected_year = st.selectbox("选择年份", years, index=0)  # 默认2025年
+
+        with col2:
+            # 月份选择
+            months = list(range(1, 13))
+            month_names = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
+            selected_month = st.selectbox("选择月份", month_names, index=10)  # 默认11月
+
+        # 生成月份键（例如：2025-11）
+        month_key = f"{selected_year}-{str(month_names.index(selected_month) + 1).zfill(2)}"
+        current_month_key = datetime.now().strftime("%Y-%m")
+
+        # 显示当前查看的月份
+        st.info(f"📊 正在查看 {selected_year}年{selected_month} 的预算情况")
+
+        # 初始化该月份的预算数据（如果不存在）
+        if month_key not in st.session_state.budgets:
+            st.session_state.budgets[month_key] = {}
+
+        # 添加新预算
+        st.subheader("➕ 添加新预算")
+        with st.form("add_budget_form"):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                new_category = st.text_input("预算类别", placeholder="例如：房租、餐饮、交通等")
+            with col2:
+                new_amount = st.number_input("预算金额", min_value=0.0, step=100.0, value=1000.0, format="%.2f")
+            with col3:
+                new_currency = st.selectbox("币种", ["人民币", "马币"])
+
+            add_submitted = st.form_submit_button("✅ 添加预算", use_container_width=True)
+
+            if add_submitted:
+                if new_category and new_category.strip():
+                    if new_category not in st.session_state.budgets[month_key]:
+                        st.session_state.budgets[month_key][new_category] = {
+                            "预算金额": new_amount,
+                            "已用金额": 0,
+                            "币种": new_currency
+                        }
+                        st.success(f"✅ 成功为 {month_key} 添加预算类别: {new_category}")
+                        self.save_data()
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {selected_month} 中该预算类别已存在")
+                else:
+                    st.error("❌ 请输入预算类别名称")
+
+        st.markdown("---")
+
+        # 复制上月预算功能
+        if month_key != "2025-11":  # 第一个月不需要复制
+            st.subheader("🔄 快速复制预算")
+            prev_month = self.get_previous_month(selected_year, month_names.index(selected_month) + 1)
+
+            if st.button(f"📋 复制 {prev_month} 的预算设置", use_container_width=True, key="copy_budget"):
+                if prev_month in st.session_state.budgets and st.session_state.budgets[prev_month]:
+                    st.session_state.budgets[month_key] = {}
+                    for category, budget_info in st.session_state.budgets[prev_month].items():
+                        st.session_state.budgets[month_key][category] = {
+                            "预算金额": budget_info["预算金额"],
+                            "已用金额": 0,  # 重置已用金额
+                            "币种": budget_info["币种"]
+                        }
+                    st.success(f"✅ 已从 {prev_month} 复制预算设置到 {month_key}")
+                    self.save_data()
+                    st.rerun()
+                else:
+                    st.warning(f"⚠️ {prev_month} 没有可复制的预算数据")
+
+        # 预算编辑和删除
+        if st.session_state.budgets[month_key]:
+            st.subheader("📊 预算执行情况")
+
+            # 计算该月的实际支出
+            self.calculate_monthly_budget_usage(selected_year, month_names.index(selected_month) + 1)
+
+            # 创建预算数据的副本用于显示和编辑
+            budget_data = []
+            total_budget = 0
+            total_used = 0
+
+            for category, budget_info in st.session_state.budgets[month_key].items():
+                currency = budget_info.get("币种", "人民币")
+                budget_amount = budget_info["预算金额"]
+                used_amount = budget_info["已用金额"]
+                remaining = budget_amount - used_amount
+                usage_percent = (used_amount / budget_amount * 100) if budget_amount > 0 else 0
+                currency_symbol = "¥" if currency == "人民币" else "RM"
+
+                total_budget += budget_amount
+                total_used += used_amount
+
+                # 状态判断
+                if usage_percent <= 80:
+                    status = "🟢 正常"
+                elif usage_percent <= 100:
+                    status = "🟡 警告"
+                else:
+                    status = "🔴 超支"
+
+                budget_data.append({
+                    "类别": category,
+                    "币种": currency,
+                    "预算金额": budget_amount,
+                    "已用金额": used_amount,
+                    "剩余金额": remaining,
+                    "使用进度": usage_percent,
+                    "状态": status
+                })
+
+            # 显示月度总览
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("总预算", f"¥{total_budget:,.2f}")
+            with col2:
+                st.metric("已使用", f"¥{total_used:,.2f}")
+            with col3:
+                st.metric("剩余预算", f"¥{total_budget - total_used:,.2f}")
+            with col4:
+                overall_usage = (total_used / total_budget * 100) if total_budget > 0 else 0
+                st.metric("总使用率", f"{overall_usage:.1f}%")
+
+            budget_df = pd.DataFrame(budget_data)
+
+            # 显示预算表格
+            if not budget_df.empty:
+                # 格式化显示用的DataFrame
+                display_df = budget_df.copy()
+                display_df["预算金额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['预算金额']:,.2f}", axis=1
+                )
+                display_df["已用金额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['已用金额']:,.2f}", axis=1
+                )
+                display_df["剩余金额"] = display_df.apply(
+                    lambda x: f"{'¥' if x['币种'] == '人民币' else 'RM'}{x['剩余金额']:,.2f}", axis=1
+                )
+                display_df["使用进度"] = display_df["使用进度"].apply(lambda x: f"{x:.1f}%")
+
+                st.dataframe(
+                    display_df[["类别", "币种", "预算金额", "已用金额", "剩余金额", "使用进度", "状态"]],
+                    use_container_width=True
+                )
+
+                # 预算编辑和删除功能
+                st.subheader("✏️ 编辑和删除预算")
+                col1, col2, col3 = st.columns([2, 1, 1])
+
+                with col1:
+                    edit_categories = list(st.session_state.budgets[month_key].keys())
+                    selected_category = st.selectbox("选择要编辑的预算类别", edit_categories, key=f"edit_{month_key}")
+
+                if selected_category:
+                    budget_info = st.session_state.budgets[month_key][selected_category]
+
+                    with col2:
+                        new_budget_amount = st.number_input(
+                            "新预算金额",
+                            min_value=0.0,
+                            step=100.0,
+                            value=float(budget_info["预算金额"]),
+                            format="%.2f",
+                            key=f"amount_{month_key}_{selected_category}"
+                        )
+
+                    with col3:
+                        new_budget_currency = st.selectbox(
+                            "币种",
+                            ["人民币", "马币"],
+                            index=0 if budget_info.get("币种", "人民币") == "人民币" else 1,
+                            key=f"currency_{month_key}_{selected_category}"
+                        )
+
+                    col4, col5 = st.columns(2)
+
+                    with col4:
+                        if st.button("✅ 更新预算", use_container_width=True,
+                                     key=f"update_{month_key}_{selected_category}"):
+                            st.session_state.budgets[month_key][selected_category]["预算金额"] = new_budget_amount
+                            st.session_state.budgets[month_key][selected_category]["币种"] = new_budget_currency
+                            st.success(f"✅ 成功更新 {selected_category} 的预算")
+                            self.save_data()
+                            st.rerun()
+
+                    with col5:
+                        # 删除功能
+                        delete_confirmed = st.checkbox(
+                            f"确认删除 '{selected_category}' 预算",
+                            key=f"confirm_delete_{month_key}_{selected_category}"
+                        )
+
+                        if st.button(
+                                "🗑️ 删除预算",
+                                use_container_width=True,
+                                type="secondary",
+                                disabled=not delete_confirmed,
+                                key=f"delete_{month_key}_{selected_category}"
+                        ):
+                            if st.session_state.budgets[month_key][selected_category]["已用金额"] > 0:
+                                st.warning(
+                                    f"⚠️ 该预算类别已有 {st.session_state.budgets[month_key][selected_category]['已用金额']} 元的使用记录")
+
+                            # 执行删除
+                            del st.session_state.budgets[month_key][selected_category]
+                            st.success(f"✅ 成功删除预算类别: {selected_category}")
+                            self.save_data()
+                            st.rerun()
+
+                # 预算使用情况图表
+                st.subheader("📈 预算执行情况图表")
+
+                # 进度条显示
+                for _, budget_row in budget_df.iterrows():
+                    category = budget_row["类别"]
+                    usage_percent = budget_row["使用进度"]
+                    budget_amount = budget_row["预算金额"]
+                    used_amount = budget_row["已用金额"]
+                    currency_symbol = "¥" if budget_row["币种"] == "人民币" else "RM"
+
+                    col1, col2 = st.columns([3, 1])
+
+                    with col1:
+                        # 设置进度条颜色
+                        if usage_percent <= 80:
+                            color = "green"
+                        elif usage_percent <= 100:
+                            color = "orange"
+                        else:
+                            color = "red"
+
+                        st.progress(
+                            min(usage_percent / 100, 1.0),
+                            text=f"{category}: {currency_symbol}{used_amount:,.2f} / {currency_symbol}{budget_amount:,.2f} ({usage_percent:.1f}%)"
+                        )
+
+                    with col2:
+                        status_text = budget_row["状态"]
+                        if "正常" in status_text:
+                            st.markdown(f"<span style='color: green'>🟢 正常</span>", unsafe_allow_html=True)
+                        elif "警告" in status_text:
+                            st.markdown(f"<span style='color: orange'>🟡 警告</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<span style='color: red'>🔴 超支</span>", unsafe_allow_html=True)
+
+                # 预算分布饼图
+                if len(st.session_state.budgets[month_key]) > 0:
+                    st.subheader("🥧 预算分布")
+                    chart_data = []
+                    for category, info in st.session_state.budgets[month_key].items():
+                        chart_data.append({
+                            "类别": category,
+                            "预算金额": info["预算金额"],
+                            "币种": info.get("币种", "人民币")
+                        })
+
+                    if chart_data:
+                        chart_df = pd.DataFrame(chart_data)
+                        fig = px.pie(
+                            chart_df,
+                            values='预算金额',
+                            names='类别',
+                            title=f'{selected_year}年{selected_month} 预算分布',
+                            hover_data=['币种']
+                        )
+                        fig.update_traces(textposition='inside', textinfo='percent+label')
+                        st.plotly_chart(fig, use_container_width=True)
+
+            else:
+                st.info("📝 本月暂无预算数据")
+
+        else:
+            st.info("📝 本月暂无预算数据，请先添加预算")
+
+    def get_previous_month(self, year, month):
+        """获取上个月的月份键"""
+        if month == 1:
+            return f"{year - 1}-12"
+        else:
+            return f"{year}-{str(month - 1).zfill(2)}"
+
+    def calculate_monthly_budget_usage(self, year, month):
+        """计算指定月份的实际预算使用情况"""
+        month_key = f"{year}-{str(month).zfill(2)}"
+
+        if month_key not in st.session_state.budgets:
+            return
+
+        # 重置所有类别的已用金额
+        for category in st.session_state.budgets[month_key]:
+            st.session_state.budgets[month_key][category]["已用金额"] = 0
+
+        # 计算实际支出
+        if not st.session_state.transactions.empty:
+            df = st.session_state.transactions.copy()
+            df['日期'] = pd.to_datetime(df['日期'])
+            df['年月'] = df['日期'].dt.strftime('%Y-%m')
+
+            monthly_expenses = df[(df['类型'] == '支出') & (df['年月'] == month_key)]
+
+            for category, group in monthly_expenses.groupby('类别'):
+                if category in st.session_state.budgets[month_key]:
+                    budget_currency = st.session_state.budgets[month_key][category].get("币种", "人民币")
+                    category_expenses = group[group['币种'] == budget_currency]
+                    st.session_state.budgets[month_key][category]["已用金额"] = category_expenses['金额'].sum()
+
+    def show_analytics(self):
+        """显示分析图表"""
+        st.header("📈 财务分析")
+
+        if not st.session_state.transactions.empty:
+            # 收支分析
+            st.subheader("💰 收支分析")
+            currency_stats = self.get_currency_statistics(st.session_state.transactions)
+
+            if currency_stats:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    # 收入饼图
+                    income_data = []
+                    for currency, stats in currency_stats.items():
+                        if stats['收入'] > 0:
+                            income_data.append({'币种': currency, '金额': stats['收入']})
+
+                    if income_data:
+                        income_df = pd.DataFrame(income_data)
+                        fig_income = px.pie(income_df, values='金额', names='币种', title='收入币种分布')
+                        st.plotly_chart(fig_income, use_container_width=True)
+
+                with col2:
+                    # 支出饼图
+                    expense_data = []
+                    for currency, stats in currency_stats.items():
+                        if stats['支出'] > 0:
+                            expense_data.append({'币种': currency, '金额': stats['支出']})
+
+                    if expense_data:
+                        expense_df = pd.DataFrame(expense_data)
+                        fig_expense = px.pie(expense_df, values='金额', names='币种', title='支出币种分布')
+                        st.plotly_chart(fig_expense, use_container_width=True)
+        else:
+            st.info("暂无足够数据进行分析")
+
+    def run_app(self):
+        """运行应用"""
+        self.sidebar()
+
+        tabs = st.tabs([
+            "💰 添加交易", "📊 交易记录", "🏦 银行卡", "📋 债务管理", "💰 预算管理", "📈 财务分析"
+        ])
+
+        with tabs[0]:
+            self.add_transaction_form()
+        with tabs[1]:
+            self.show_transactions()
+        with tabs[2]:
+            self.show_bank_accounts()
+        with tabs[3]:
+            self.show_debts()
+        with tabs[4]:
+            self.show_budgets()
+        with tabs[5]:
+            self.show_analytics()
+
+
+def main():
+    """主函数"""
+    st.set_page_config(
+        page_title="智能记账本 - 安全版",
+        page_icon="🔒",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # 初始化会话状态
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if 'current_user' not in st.session_state:
+        st.session_state.current_user = None
+
+    # 自定义CSS
+    st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .login-container {
+        max-width: 400px;
+        margin: 0 auto;
+        padding: 2rem;
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        background-color: #f9f9f9;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # 用户管理
+    user_manager = UserManager()
+
+    if not st.session_state.logged_in:
+        # 登录/注册界面
+        st.markdown('<h1 class="main-header">🔒 智能记账本 - 安全版</h1>', unsafe_allow_html=True)
+
+        tab1, tab2 = st.tabs(["🚪 登录", "📝 注册"])
+
+        with tab1:
+            with st.form("login_form"):
+                st.subheader("用户登录")
+                username = st.text_input("用户名", placeholder="请输入用户名")
+                password = st.text_input("密码", type="password", placeholder="请输入密码")
+                login_btn = st.form_submit_button("登录", use_container_width=True)
+
+                if login_btn:
+                    if username and password:
+                        success, message = user_manager.verify_user(username, password)
+                        if success:
+                            st.session_state.logged_in = True
+                            st.session_state.current_user = username
+                            st.success(f"欢迎回来，{username}！")
+                            st.rerun()
+                        else:
+                            st.error(message)
+                    else:
+                        st.error("请输入用户名和密码")
+
+        with tab2:
+            with st.form("register_form"):
+                st.subheader("新用户注册")
+                new_username = st.text_input("用户名", placeholder="请输入用户名（3-20位字符）")
+                new_password = st.text_input("密码", type="password", placeholder="请输入密码（至少6位）")
+                confirm_password = st.text_input("确认密码", type="password", placeholder="请再次输入密码")
+                register_btn = st.form_submit_button("注册", use_container_width=True)
+
+                if register_btn:
+                    if new_username and new_password and confirm_password:
+                        if len(new_username) < 3 or len(new_username) > 20:
+                            st.error("用户名长度应在3-20位之间")
+                        elif len(new_password) < 6:
+                            st.error("密码长度至少6位")
+                        elif new_password != confirm_password:
+                            st.error("两次输入的密码不一致")
+                        else:
+                            success, message = user_manager.register_user(new_username, new_password)
+                            if success:
+                                st.success(message)
+                                st.info("请返回登录页面进行登录")
+                            else:
+                                st.error(message)
+                    else:
+                        st.error("请填写所有字段")
+
+    else:
+        # 已登录，显示主应用
+        finance_app = FinanceApp(st.session_state.current_user)
+        finance_app.run_app()
+
+
+if __name__ == "__main__":
+    main()
